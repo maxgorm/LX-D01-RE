@@ -60,51 +60,61 @@ def parse_notify(data: bytes) -> Optional[tuple[int, List[int]]]:
 
 
 async def send_wwr(client: BleakClient, payload: bytes):
+    print(f"WRITE -> {payload.hex(' ')}")
     await client.write_gatt_char(WRITE_UUID, payload, response=False)
 
 
 async def notify_handler(state: JobState, data: bytearray):
+    print(f"NOTIFY <- {bytes(data).hex(' ')}")
     parsed = parse_notify(bytes(data))
     if not parsed:
+        print("   (ignored: not 0x5A)")
         return
     op, words = parsed
-    # 0x06 = completion, 0x04 = echo (may repeat until ACK), 0x07 = progress
+    print(f"   op=0x{op:02X} words={words}")
     if op == 0x06 and len(words) >= 2:
         state.completion_seen = True
         state.complete_event.set()
+        print("   completion seen, setting event")
 
 
 async def main():
     # Find device by address or by name
     device = None
     if PRINTER_ADDRESS != "AA:BB:CC:DD:EE:FF":
+        print(f"Searching by address {PRINTER_ADDRESS} ...")
         device = await BleakScanner.find_device_by_address(PRINTER_ADDRESS, timeout=10.0)
     if device is None:
         devices = await BleakScanner.discover(timeout=10.0)
+        print(f"Discovered {len(devices)} devices")
         for d in devices:
             if d.name and PRINTER_NAME in d.name:
                 device = d
                 break
     if device is None:
         raise SystemExit("Printer not found; set PRINTER_ADDRESS or ensure the device advertises name LX-D01")
+    print(f"Using device: {device}")
 
     # Example image payload (replace with real raster data)
     sample_image = b"\xFF\x00" * 200  # 400 bytes → 25 blocks of 16 bytes
     blocks = chunk_image(sample_image)
     block_count = len(blocks)
+    print(f"Prepared {block_count} blocks")
 
     state = JobState(block_count=block_count, job_id=1, complete_event=asyncio.Event())
 
     async with BleakClient(device) as client:
+        print("Connecting...")
         if not client.is_connected:
             raise SystemExit("Failed to connect")
-
+        print("Connected, enabling notify")
         await client.start_notify(NOTIFY_UUID, lambda _, data: asyncio.create_task(notify_handler(state, data)))
 
         # Optional: wait a moment for initial 5A02 status
         await asyncio.sleep(0.2)
 
         # Send start job (5A04) with block_count and job_id
+        print(f"Sending start frame for job {state.job_id} with {block_count} blocks")
         start_frame = build_sa(op=0x04, w1=block_count, w2=state.job_id)
         await send_wwr(client, start_frame)
 
@@ -120,17 +130,20 @@ async def main():
             await asyncio.sleep(0.001)
             in_flight = max(0, in_flight - 1)
 
+        print("Waiting for completion notify (5A06)...")
         # Wait for completion notify (5A06)
         try:
             await asyncio.wait_for(state.complete_event.wait(), timeout=10.0)
         except asyncio.TimeoutError:
             raise SystemExit("Timeout waiting for 5A06 completion")
 
+        print("Sending completion ACK")
         # ACK completion with 5A04 …0100…
         ack_frame = build_sa(op=0x04, w1=block_count, w2=0x0100)
         await send_wwr(client, ack_frame)
 
         await asyncio.sleep(0.5)  # allow repeats/cleanup
+        print("Stopping notify and closing connection")
         await client.stop_notify(NOTIFY_UUID)
 
 
